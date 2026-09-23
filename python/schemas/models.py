@@ -20,9 +20,18 @@ class MarketOdds(BaseModel):
 
 
 class OddsEvent(BaseModel):
-    """The universal schema every scraper must normalize its payload into."""
+    """The universal schema every scraper must normalize its payload into.
 
-    event_id: str = Field(..., description="MD5 hash of home+away+start_time_utc")
+    `event_id` is deliberately optional: a scraper reports raw team names as
+    scraped, and cannot compute the MD5 hash itself because that requires
+    entity resolution (mapping "K. Chiefs" -> the universal team id), which
+    only the normalization engine can do. Ingestion leaves it unset; the
+    engine fills it in before publishing downstream.
+    """
+
+    event_id: str | None = Field(
+        default=None, description="MD5 hash of home+away+start_time_utc, set by the engine, not the scraper"
+    )
     sport: str
     league: str
     home_team: str
