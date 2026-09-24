@@ -1,3 +1,4 @@
+from .channels import ARBITRAGE_CHANNEL, RAW_ODDS_CHANNEL
 from .models import (
     ArbEvent,
     ArbExpiredEvent,
@@ -12,4 +13,6 @@ __all__ = [
     "ArbEvent",
     "ArbExpiredEvent",
     "ArbStake",
+    "RAW_ODDS_CHANNEL",
+    "ARBITRAGE_CHANNEL",
 ]
