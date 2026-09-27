@@ -119,7 +119,7 @@ sequenceDiagram
 </pre>
 </div>
 
-<h2>3. Azure Infrastructure (South Africa North)</h2>
+<h2>3. Azure Infrastructure (UAE North)</h2>
 <div class="diagram">
 <pre class="mermaid">
 flowchart TB
@@ -127,7 +127,7 @@ flowchart TB
         ACT["GitHub Actions<br/>Build + Push + Deploy<br/>(not yet built)"]
     end
 
-    subgraph Azure["Azure -- South Africa North"]
+    subgraph Azure["Azure -- UAE North<br/>(South Africa North disallowed by subscription policy)"]
         subgraph VNet["Virtual Network"]
             subgraph CAEnv["Container Apps Environment"]
                 CA1["scanner-api<br/>external ingress, autoscaled"]

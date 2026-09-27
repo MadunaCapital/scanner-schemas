@@ -58,7 +58,7 @@ The original plan (and the first draft of `scanner-infra`) targeted AWS (`af-sou
 | Redis | Azure Cache for Redis, private-endpoint-only |
 | Database | PostgreSQL Flexible Server, VNet-integrated |
 | Container images | Azure Container Registry |
-| Region | South Africa North (Johannesburg) — Azure's equivalent to `af-south-1` for latency to SA bookmakers |
+| Region | **UAE North** — South Africa North would have been the latency-optimal choice (Azure's equivalent to `af-south-1`), but the deploying subscription's regional-access policy doesn't allow it; UAE North is the closest geographically-permitted region |
 
 `scanner-engine`, `scanner-ingestion-betway-za`, and `scanner-ingestion-wsb` are each pinned to exactly 1 replica in Terraform — they're singleton background workers, not horizontally scalable; a second copy of any of them would double-publish everything.
 

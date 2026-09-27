@@ -85,7 +85,7 @@ sequenceDiagram
     U->>BM: Manually place bets on each leg
 ```
 
-## 3. Azure Infrastructure (South Africa North)
+## 3. Azure Infrastructure (UAE North)
 
 ```mermaid
 flowchart TB
@@ -93,7 +93,7 @@ flowchart TB
         ACT["GitHub Actions<br/>Build + Push + Deploy<br/>(not yet built)"]
     end
 
-    subgraph Azure["Azure -- South Africa North"]
+    subgraph Azure["Azure -- UAE North<br/>(South Africa North disallowed by subscription policy)"]
         subgraph VNet["Virtual Network"]
             subgraph CAEnv["Container Apps Environment"]
                 CA1["scanner-api<br/>external ingress, autoscaled"]
