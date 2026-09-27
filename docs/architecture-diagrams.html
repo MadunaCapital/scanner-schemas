@@ -17,6 +17,7 @@
   h1 { font-size: 1.6rem; margin-bottom: 4px; }
   h2 { font-size: 1.2rem; margin-top: 48px; border-bottom: 1px solid #333; padding-bottom: 8px; }
   p.sub { color: #999; margin-top: 0; }
+  p.status { color: #f59e0b; font-size: 0.9rem; }
   .diagram {
     background: #1a1d27;
     border: 1px solid #2a2d3a;
@@ -31,53 +32,52 @@
 <body>
 
 <h1>MadunaCapital — Arbitrage Scanner Architecture</h1>
-<p class="sub">Companion diagrams for arbitrage-scanner-plan.md. Open this file directly in a browser to view.</p>
+<p class="sub">Reflects the as-built system (see as-built-architecture.md) — not the original brainstorm, which assumed anti-bot evasion and AWS; neither turned out to be what was actually needed or used.</p>
 
 <h2>1. System Architecture (End-to-End Data Flow)</h2>
 <div class="diagram">
 <pre class="mermaid">
 flowchart LR
     subgraph Sources["SA Bookmakers"]
-        BM1[Betway ZA]
-        BM2[Hollywoodbets]
-        BM3[Supabets]
-        BM4[World Sports Betting]
+        BM1["Betway ZA<br/>public JSON endpoint"]
+        BM2["World Sports Betting<br/>public JSON endpoint"]
     end
 
-    subgraph Ingestion["Ingestion Layer (ECS Fargate)"]
-        SC1[Scraper: curl_cffi]
-        SC2["Playwright Stealth<br/>Cloudflare Solver"]
+    subgraph Ingestion["Ingestion (one repo per bookmaker)"]
+        SC1["scanner-ingestion-betway-za<br/>plain httpx, no evasion"]
+        SC2["scanner-ingestion-wsb<br/>plain httpx, no evasion"]
     end
 
-    subgraph Processing["Processing"]
-        NORM["Normalization Engine<br/>Entity Resolution"]
-        ENGINE["Arbitrage Detection Engine<br/>Implied Prob + Stake Calc"]
+    subgraph Engine["scanner-engine"]
+        AGG["OddsAggregator<br/>exact-name event matching<br/>arb_new / arb_update / arb_expired"]
+        MATH["Arbitrage Math<br/>implied prob + stake calc"]
     end
 
-    subgraph Storage["Storage & Cache"]
-        REDIS[("Redis<br/>ElastiCache")]
-        PG[("PostgreSQL<br/>Accounts, History")]
+    subgraph Storage["Storage"]
+        REDIS[("Redis<br/>pub/sub only, nothing at rest")]
+        PG[("PostgreSQL<br/>arb history + entity dictionary")]
     end
 
     subgraph Delivery["API & Frontend"]
-        API["FastAPI<br/>SSE Stream"]
-        UI[React Dashboard]
+        API["scanner-api<br/>FastAPI SSE"]
+        UI["scanner-frontend<br/>React Dashboard"]
     end
 
     USER["User<br/>Manual Bet Placement"]
 
-    BM1 & BM2 & BM3 & BM4 -->|odds/JSON| SC1
-    BM1 & BM2 & BM3 & BM4 -.->|JS challenge| SC2
-    SC2 -->|cf_clearance cookie| SC1
-    SC1 -->|raw JSON| NORM
-    NORM -->|normalized events| REDIS
-    NORM --> PG
-    REDIS --> ENGINE
-    ENGINE -->|arb_new/update/expired| REDIS
-    REDIS -->|pub/sub| API
+    BM1 -->|odds/JSON| SC1
+    BM2 -->|odds/JSON| SC2
+    SC1 -->|raw OddsEvent| REDIS
+    SC2 -->|raw OddsEvent| REDIS
+    REDIS -->|RAW_ODDS_CHANNEL| AGG
+    AGG --> MATH
+    AGG -->|history| PG
+    AGG -->|ARBITRAGE_CHANNEL| REDIS
+    REDIS --> API
     API -->|SSE stream| UI
     UI --> USER
-    USER -->|places bets| BM1 & BM2 & BM3 & BM4
+    USER -->|places bets manually| BM1
+    USER -->|places bets manually| BM2
 </pre>
 </div>
 
@@ -85,81 +85,76 @@ flowchart LR
 <div class="diagram">
 <pre class="mermaid">
 sequenceDiagram
-    participant BM as Bookmaker Site
-    participant PW as Playwright (stealth)
-    participant CF as curl_cffi (fast client)
-    participant NORM as Normalization Engine
-    participant ENGINE as Arb Detection Engine
+    participant BM as Bookmaker's public endpoint
+    participant SC as Bookmaker repo (httpx)
     participant REDIS as Redis Pub/Sub
-    participant API as FastAPI SSE
+    participant AGG as OddsAggregator
+    participant PG as Postgres
+    participant API as scanner-api (SSE)
     participant UI as React Dashboard
     participant U as User
 
-    PW->>BM: Load page, solve Cloudflare challenge
-    BM-->>PW: cf_clearance cookie + session
-    PW->>CF: Export cookies + user agent
-    loop Every polling interval / WebSocket tick
-        CF->>BM: Request odds JSON (impersonated TLS)
-        BM-->>CF: Raw odds payload
-        CF->>NORM: Raw JSON
-        NORM->>NORM: Map teams/markets, convert odds, hash event ID
-        NORM->>REDIS: Publish normalized event
+    loop Every 45s (plain, fixed interval)
+        SC->>BM: GET public odds endpoint
+        BM-->>SC: JSON payload
+        SC->>SC: Map to OddsEvent (schema-defined, event_id left unset)
+        SC->>REDIS: Publish to RAW_ODDS_CHANNEL
     end
-    REDIS->>ENGINE: Normalized odds
-    ENGINE->>ENGINE: Calculate implied probability + margin
-    alt Margin < 100%
-        ENGINE->>REDIS: Publish arb_new (stakes, ROI, expires_at)
-        REDIS->>API: Pub/Sub message
-        API->>UI: SSE event: arb_new
-        UI->>U: Show alert + stake calculator
-        U->>BM: Manually place bets on each leg
-    else Margin >= 100%
-        ENGINE->>ENGINE: Discard, no arb
+    REDIS->>AGG: OddsEvent
+    AGG->>AGG: Hash event (exact team-name match), compare best odds across bookmakers
+    alt Margin < 100% (new arb)
+        AGG->>REDIS: Publish arb_new
+        AGG->>PG: Insert arb_events row
+    else Still active, odds changed
+        AGG->>REDIS: Publish arb_update
+        AGG->>PG: Update arb_events row
+    else No longer profitable
+        AGG->>REDIS: Publish arb_expired
+        AGG->>PG: Mark arb_events row expired
     end
+    REDIS->>API: Pub/Sub message
+    API->>UI: SSE event: arb_new / arb_update / arb_expired
+    UI->>U: Show/update/remove alert, recompute stakes against typed-in bankroll
+    U->>BM: Manually place bets on each leg
 </pre>
 </div>
 
-<h2>3. AWS Infrastructure (af-south-1)</h2>
+<h2>3. Azure Infrastructure (South Africa North)</h2>
 <div class="diagram">
 <pre class="mermaid">
 flowchart TB
     subgraph GH["GitHub"]
-        ACT["GitHub Actions<br/>Build + Push + Deploy"]
+        ACT["GitHub Actions<br/>Build + Push + Deploy<br/>(not yet built)"]
     end
 
-    subgraph AWS["AWS af-south-1 (Cape Town)"]
-        subgraph VPC["VPC"]
-            subgraph Public["Public Subnets"]
-                NAT[NAT Gateway]
-                ALB["Application Load Balancer<br/>idle_timeout=3600, HTTP/2"]
+    subgraph Azure["Azure -- South Africa North"]
+        subgraph VNet["Virtual Network"]
+            subgraph CAEnv["Container Apps Environment"]
+                CA1["scanner-api<br/>external ingress, autoscaled"]
+                CA2["scanner-engine<br/>1 replica, singleton"]
+                CA3["scanner-ingestion-betway-za<br/>1 replica, singleton"]
+                CA4["scanner-ingestion-wsb<br/>1 replica, singleton"]
             end
-            subgraph Private["Private Subnets"]
-                ECS1["ECS Fargate<br/>Scrapers"]
-                ECS2["ECS Fargate<br/>FastAPI Backend"]
-                REDIS[("ElastiCache Redis<br/>cache.c6g.large")]
-                RDS[("RDS PostgreSQL")]
-            end
+            REDIS[("Azure Cache for Redis<br/>private endpoint only")]
+            PG[("Postgres Flexible Server<br/>VNet-integrated")]
         end
-        ECR["ECR<br/>Docker Images"]
+        ACR["Azure Container Registry"]
     end
 
-    PROXY["Residential/Mobile<br/>Proxy Provider"]
-    INTERNET(("SA Bookmaker Sites"))
     USERBROWSER["User Browser"]
 
-    ACT -->|push image| ECR
-    ACT -->|deploy| ECS1
-    ACT -->|deploy| ECS2
-    ECR --> ECS1
-    ECR --> ECS2
-    ECS1 -->|egress| NAT
-    NAT --> PROXY
-    PROXY -->|scrape| INTERNET
-    ECS1 <--> REDIS
-    ECS2 <--> REDIS
-    ECS2 <--> RDS
-    ALB --> ECS2
-    USERBROWSER --> ALB
+    ACT -->|push image| ACR
+    ACT -->|deploy revision| CA1
+    ACT -->|deploy revision| CA2
+    ACT -->|deploy revision| CA3
+    ACT -->|deploy revision| CA4
+    ACR --> CA1 & CA2 & CA3 & CA4
+    CA1 <--> REDIS
+    CA2 <--> REDIS
+    CA3 --> REDIS
+    CA4 --> REDIS
+    CA2 <--> PG
+    USERBROWSER --> CA1
 </pre>
 </div>
 
@@ -167,16 +162,18 @@ flowchart TB
 <div class="diagram">
 <pre class="mermaid">
 flowchart TD
-    IN["Incoming scraped team name"] --> T1{"Tier 1:<br/>Redis Exact Match<br/>sub-millisecond"}
-    T1 -->|hit| OUT["Universal team_id"]
+    IN["Incoming scraped team name"] --> T1{"Tier 1:<br/>In-memory Exact Match<br/>sub-millisecond"}
+    T1 -->|hit| OUT["Universal team name"]
     T1 -->|miss| T2{"Tier 2:<br/>RapidFuzz<br/>token_sort_ratio"}
-    T2 -->|score >= 88%| CACHE["Write to Redis cache"] --> OUT
+    T2 -->|score >= 88%| CACHE["Write to in-memory cache<br/>+ persist to Postgres team_aliases"] --> OUT
     T2 -->|score < 88%| T3["Tier 3:<br/>Dead Letter Queue<br/>Manual Review"]
     T3 -->|admin links team| CACHE
 </pre>
 </div>
+<p class="status">Status: built and tested (normalization.py, entity_store.py), but not yet called by aggregator.py — event matching across bookmakers is exact-name-only today.</p>
 
-<h2>5. Suggested Build Order (Roadmap)</h2>
+<h2>5. Original Build Order (Historical)</h2>
+<p class="sub">This was the plan going in. Actual work followed a similar shape but diverged in the details — notably, bookmaker integration turned out not to need the stealth/Cloudflare tooling this roadmap assumed, and a database layer + full Azure infra were added as later, separate milestones once 2 bookmakers were working.</p>
 <div class="diagram">
 <pre class="mermaid">
 flowchart LR

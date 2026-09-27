@@ -2,6 +2,8 @@
 Source: Gemini conversation — https://gemini.google.com/app/633110fbf280cd98
 Exported: 2026-09-24
 
+> **This is the original brainstorm, kept as a historical record — not the current state of the project.** Several of its specifics turned out different once actually built: bookmaker integration didn't need the anti-bot evasion tooling discussed at length below (see the "How a bookmaker actually gets integrated" section of [as-built-architecture.md](as-built-architecture.md)), and infrastructure targets Azure, not the AWS setup detailed near the end. For what's actually true today, read [as-built-architecture.md](as-built-architecture.md) and the addendum below it in this same file. This transcript is left otherwise unedited.
+
 ---
 
 ## User prompt: I need you to help me plan out the architecture of an arbitrage scanner web app
