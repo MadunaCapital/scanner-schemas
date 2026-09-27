@@ -7,7 +7,7 @@ This is the current, real state of the project — as opposed to `arbitrage-scan
 | Repo | Role |
 |---|---|
 | `scanner-schemas` | Shared contracts: Pydantic models (`OddsEvent`, `MarketOdds`, `ArbEvent`, `ArbStake`, `ArbExpiredEvent`) and the two Redis channel name constants (`RAW_ODDS_CHANNEL`, `ARBITRAGE_CHANNEL`). Everything else depends on this. |
-| `scanner-ingestion` | Shared, bookmaker-agnostic toolkit: `BaseScraper` abstract class, `ProxyConfig`, the generic `raw_publisher` (publishes `OddsEvent`s to Redis). Also carries an unused `stealth` extra (TLS-impersonated client, Cloudflare session handling) kept for a bookmaker that turns out to actually need it — none has, so far. |
+| `scanner-ingestion` | Shared, bookmaker-agnostic toolkit: `BaseScraper` abstract class, the generic `raw_publisher` (publishes `OddsEvent`s to Redis). Previously also carried a `stealth` extra (TLS-impersonated client, Cloudflare session handling) — stripped out on 2026-09-27 once real experience across 5 bookmakers showed it wasn't earning its place. |
 | `scanner-ingestion-betway-za` | Real, live Betway ZA scraper. Public unauthenticated JSON endpoint, plain `httpx`, no evasion. |
 | `scanner-ingestion-wsb` | Real, live World Sports Betting scraper. Same approach, different (nested) response shape. |
 | `scanner-engine` | Normalization, arbitrage math, cross-bookmaker aggregation, and persistence. The one service allowed to do blocking I/O (DB), everything else stays fast. |
@@ -17,7 +17,7 @@ This is the current, real state of the project — as opposed to `arbitrage-scan
 
 ## How a bookmaker actually gets integrated
 
-The plan originally assumed every SA bookmaker would need scraping evasion (TLS impersonation, Cloudflare-solving, stealth browsers) to reach their odds data. **In practice, neither bookmaker built so far needs any of that**: both Betway ZA and World Sports Betting serve odds via a plain, unauthenticated JSON endpoint that their own site's frontend calls — the same request any visitor's browser makes. `scanner-ingestion`'s `stealth` extra exists for a bookmaker that turns out to actually gate its odds behind a WAF, but isn't used by either scraper today.
+The plan originally assumed every SA bookmaker would need scraping evasion (TLS impersonation, Cloudflare-solving, stealth browsers) to reach their odds data. **In practice, neither bookmaker built so far needs any of that**: both Betway ZA and World Sports Betting serve odds via a plain, unauthenticated JSON endpoint that their own site's frontend calls — the same request any visitor's browser makes. The evasion tooling this assumption produced (`scanner-ingestion`'s `stealth` extra) sat unused and was removed entirely on 2026-09-27. If a genuinely WAF-protected bookmaker turns up later, building that tooling is a real decision to make fresh at that point, not something worth having pre-built speculatively.
 
 Bookmakers tried and not yet cracked (harder API shapes — undocumented params, WebSocket/SignalR push, or Kambi-style session widgets, not evasion difficulty): Hollywoodbets, Sportingbet ZA, Bet.co.za. Confirmed licensed via the NGB verified-operators portal but not yet attempted: Supabets, Easybet, PantherBet, Swifty Sports.
 
