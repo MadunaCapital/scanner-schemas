@@ -1,6 +1,6 @@
 # As-Built Architecture
 
-This is the current, real state of the project — as opposed to `arbitrage-scanner-plan.md`, which is the original brainstorming transcript (kept as a historical record; several of its specifics, like which bookmakers use what tech, turned out different once actually built) and its hardening addendum. Where the two disagree, this document is correct. Last updated 2026-09-27.
+This is the current, real state of the project — as opposed to `arbitrage-scanner-plan.md`, which is the original brainstorming transcript (kept as a historical record; several of its specifics, like which bookmakers use what tech, turned out different once actually built) and its hardening addendum. Where the two disagree, this document is correct. Last updated 2026-09-28.
 
 ## Repos (9 total)
 
@@ -27,7 +27,8 @@ Bookmakers tried and not yet cracked (harder API shapes — undocumented params,
 scanner-ingestion-betway-za  ─┐
                                ├─→ Redis: RAW_ODDS_CHANNEL ─→ scanner-engine
 scanner-ingestion-wsb        ─┘                                   │
-                                                                   ├─→ OddsAggregator (exact-name event matching,
+                                                                   ├─→ OddsAggregator (EntityResolver-based event
+                                                                   │    matching: exact alias → fuzzy → dead-letter,
                                                                    │    arb_new / arb_update / arb_expired lifecycle,
                                                                    │    staleness filtering, memory pruning)
                                                                    │
@@ -36,15 +37,19 @@ scanner-ingestion-wsb        ─┘                                   │
                                                                    └─→ Redis: ARBITRAGE_CHANNEL ─→ scanner-api (SSE) ─→ scanner-frontend
 ```
 
-## Known gap: entity resolution isn't wired in yet
+## Entity resolution is now wired into the matching path (closed 2026-09-28)
 
-`scanner-engine/normalization.py`'s `EntityResolver` (three-tier fuzzy matching) and its persistence layer (`entity_store.py`, backed by the `team_aliases` Postgres table) are both built and tested — but `aggregator.py` doesn't call either yet. Event matching across bookmakers is still exact team-name string matching only. A name variant ("K. Chiefs" vs "Kaizer Chiefs") won't be recognized as the same match. Safe failure mode (a missed opportunity, never a false one), but it's the single biggest correctness gap right now, and the natural next thing to close.
+`scanner-engine/normalization.py`'s `EntityResolver` (three-tier: exact alias cache → RapidFuzz fuzzy match → dead-letter queue) is now called from `OddsAggregator.ingest()` (`aggregator.py`) for both `home_team` and `away_team` before events are grouped/hashed, instead of grouping by raw scraped team-name string equality. `OddsAggregator` takes a `resolver: EntityResolver` (shared with the one `__main__.py` loads from the `team_aliases` Postgres table at startup via `entity_store.load_aliases_into_resolver`, so previously-resolved aliases are honored immediately on every restart).
+
+A name that resolves via Tier 1 (exact) or Tier 2 (fuzzy, ≥88 token_sort_ratio) is grouped by that canonical name, so a bookmaker's variant spelling ("Man Utd" vs "Manchester United") is now correctly matched to the same real-world event. A name that resolves via neither tier is queued to `EntityResolver.dead_letter_queue` for manual review (see `entity_store.persist_manual_link`) — this is never silently dropped and never crashes the aggregator, but the event is tracked under its own raw name in the meantime (the prior exact-string-match behaviour, kept only as the unresolved fallback), so it won't be merged with another bookmaker's spelling of the same team until someone resolves the dead-letter entry. `EntityResolver.resolve()` now also dedupes dead-letter entries by (league, case-insensitive name), since a live polling loop calls it on every re-scrape (e.g. every ~45s) and would otherwise grow the queue unboundedly for a name that stays unresolved.
+
+Known remaining limitation: `EntityResolver`'s fuzzy tier (Tier 2) is O(cache size) per unresolved lookup and was originally documented as unsafe for a live hot path; wiring it into `ingest()` means a team that never resolves pays that cost on every single poll cycle for as long as it stays unresolved. Not a correctness problem (same safe failure mode as before: a missed match, never a false one), but worth watching as the alias dictionary and the set of never-resolved teams both grow.
 
 ## Database
 
 Real schema (`scanner-engine/src/engine/models_db.py`), migrated via Alembic:
 - `arb_events` — every detected arbitrage opportunity, with status (`active`/`expired`), margin, ROI, stakes (JSON), timestamps.
-- `team_aliases` — the entity-resolution dictionary (currently populated by nothing automatically; see the gap above).
+- `team_aliases` — the entity-resolution dictionary, loaded into `EntityResolver`'s in-memory cache at engine startup (see above) and consulted on every odds event; still populated only via the manual-link path (`entity_store.persist_manual_link`), since the "admin dashboard" for resolving dead-letter entries doesn't exist yet.
 
 Defaults to a local SQLite file for zero-config dev; production points `DATABASE_URL` at the real Postgres Flexible Server provisioned in `scanner-infra`.
 
