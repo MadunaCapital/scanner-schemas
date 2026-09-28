@@ -70,3 +70,35 @@ class ArbExpiredEvent(BaseModel):
     id: str
     reason: Literal["odds_moved", "market_suspended", "market_voided", "ttl_elapsed"]
     type: Literal["arb_expired"] = "arb_expired"
+
+
+class ScraperHeartbeat(BaseModel):
+    """Written to `heartbeat:{bookmaker_id}` (see heartbeat.py) by
+    scanner-ingestion's run_scraper_loop after every poll cycle it observes.
+    Read by scanner-api's /api/health/scrapers for the frontend's status page.
+    """
+
+    bookmaker_id: str
+    status: Literal["ok", "error"]
+    timestamp: datetime
+    events_published_this_cycle: int = 0
+    error_message: str | None = None
+
+
+class EngineHeartbeat(BaseModel):
+    """Written to `heartbeat:engine` (see heartbeat.py) by scanner-engine's
+    runner.py. Reports the health of the whole downstream pipeline -- Redis
+    connectivity, whether a Postgres write has actually succeeded recently,
+    and basic throughput -- not just "is the process alive". Read by
+    scanner-api's /api/health/system for the frontend's status page.
+    """
+
+    status: Literal["ok", "error"]
+    timestamp: datetime
+    redis_connected: bool
+    postgres_connected: bool | None = Field(
+        default=None, description="None means no database was configured for this run"
+    )
+    messages_processed_total: int = 0
+    last_db_write_at: datetime | None = None
+    error_message: str | None = None

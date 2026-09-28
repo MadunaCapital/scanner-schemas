@@ -46,3 +46,24 @@ export interface ArbExpiredEvent {
   reason: "odds_moved" | "market_suspended" | "market_voided" | "ttl_elapsed";
   type: "arb_expired";
 }
+
+// Mirrors the heartbeat payloads scanner-api's /api/health/* endpoints
+// serve (read from the heartbeat:* Redis keys scanner-ingestion and
+// scanner-engine write -- see scanner-schemas/python/schemas/heartbeat.py).
+export interface ScraperHeartbeat {
+  bookmaker_id: string;
+  status: "ok" | "error";
+  timestamp: string; // ISO 8601 UTC
+  events_published_this_cycle: number;
+  error_message?: string | null;
+}
+
+export interface EngineHeartbeat {
+  status: "ok" | "error";
+  timestamp: string; // ISO 8601 UTC
+  redis_connected: boolean;
+  postgres_connected: boolean | null;
+  messages_processed_total: number;
+  last_db_write_at?: string | null; // ISO 8601 UTC
+  error_message?: string | null;
+}

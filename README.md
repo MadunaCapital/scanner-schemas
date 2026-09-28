@@ -4,8 +4,9 @@ Shared contracts for the MadunaCapital arbitrage scanner. This is the single sou
 
 ## Contents
 
-- `python/schemas/models.py` — Pydantic models (`OddsEvent`, `MarketOdds`, `ArbEvent`, `ArbStake`, `ArbExpiredEvent`), installable as a package
+- `python/schemas/models.py` — Pydantic models (`OddsEvent`, `MarketOdds`, `ArbEvent`, `ArbStake`, `ArbExpiredEvent`, `ScraperHeartbeat`, `EngineHeartbeat`), installable as a package
 - `python/schemas/channels.py` — the two Redis channel name constants (`RAW_ODDS_CHANNEL`, `ARBITRAGE_CHANNEL`), so they can't silently drift between the repos that publish/subscribe to them
+- `python/schemas/heartbeat.py` — the `heartbeat:*` Redis key naming (`HEARTBEAT_KEY_PREFIX`, `ENGINE_HEARTBEAT_ID`, `heartbeat_key()`) that scanner-ingestion and scanner-engine write liveness heartbeats to, and scanner-api reads for its `/api/health/*` endpoints
 - `typescript/` — mirrored TypeScript types for the frontend
 - `docs/as-built-architecture.md` — **start here** for what the project actually is today
 - `docs/arbitrage-scanner-plan.md` + `docs/architecture-diagrams.md` — the original brainstorm and its diagrams, kept as a historical record (several specifics turned out different once actually built — see the as-built doc for what's current)
