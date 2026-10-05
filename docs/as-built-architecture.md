@@ -18,7 +18,7 @@ A long-form, illustrated version of this document (animated diagrams, the arbitr
 | `scanner-ingestion-supabets` | SupaBets scraper (H3 B2C API). |
 | `scanner-engine` | Entity resolution, cross-bookmaker aggregation, arbitrage math, arb lifecycle, and persistence. The one service that does blocking-ish I/O (DB); everything else stays fast. |
 | `scanner-api` | FastAPI: SSE stream of arb events, upcoming-fixtures endpoint for the calendar, and health endpoints for the status page. |
-| `scanner-frontend` | React dashboard (Arb Feed, Calendar, Status, Docs), served by nginx. |
+| `scanner-frontend` | React dashboard (Arb Feed, Calendar, Status, Bankroll, Docs), served by nginx. |
 | `scanner-infra` | All Terraform, targeting **Azure** (not AWS — switched over entirely on 2026-09-27). |
 
 The split is deliberately maximal — one repo, image and Container App per bookmaker — trading some duplicated code for isolation: a broken adapter can't take down another bookmaker's pipeline. The only coupling between repos is `scanner-schemas`.
@@ -182,7 +182,7 @@ Expected now, at South Africa North retail prices: Container Apps ≈ $72, Postg
 ## Known gaps / possible next steps
 
 - **Arb analysis** (once ~2 weeks of `arb_snapshots` exist): survival curves for time-to-place, peak timing, pre-match vs in-play, and the causing bookmaker, all per sport.
-- **Bankroll tooling:** per-bookmaker standby funds sized from history, a linear program to choose among simultaneous arbs given each book's balance, and a portfolio page tracking placed arbs and per-book balances before and after payout. The API has no authentication yet, so that must come first.
+- **Bankroll page (built 2026-10-05, browser-only):** `scanner-frontend/src/components/bankroll/`. The user enters per-bookmaker balances. An exact LP (simplex, `optimizer.js`, unit-tested with `npm test`) maximises Σ(1/Mₐ − 1)·xₐ over all live arbs, subject to each bookmaker's balance, a per-arb cap and a minimum leg stake. It records placed bets (with the odds and stakes actually obtained), settles or voids them, shows each book's balance range after open bets settle, and suggests transfers back to target floats. State is in `localStorage` only. **Next:** add authentication (simplest is the API proxied behind the frontend's origin with one Entra sign-in), then move this state to Postgres and size floats from `arb_snapshots` history.
 - **SSE idle behaviour** through Container Apps' Envoy ingress hasn't been explicitly verified for long quiet periods (the ~1.1 s keep-alive should cover it).
 - **Hardening:** managed identity + AcrPull instead of ACR admin credentials; secrets (Postgres password) in Key Vault instead of tfvars.
 - More markets (totals, handicaps); N-way outrights would need a schema change.
