@@ -25,14 +25,14 @@ flowchart LR
     end
 
     subgraph Engine["scanner-engine (1 replica)"]
-        ER["EntityResolver<br/>exact -> fuzzy -> dead-letter"]
+        ER["EventMatcher<br/>sport + kickoff +-15 min + both names fuzzy"]
         AGG["OddsAggregator<br/>md5 event hash, 120s freshness gate,<br/>best price per outcome, >= 2 bookmakers<br/>arb_new / arb_update / arb_expired"]
         MATH["Arbitrage Math<br/>M = sum(1/d) < 1, S = B*IP/M"]
     end
 
     REDIS[("Redis channel<br/>raw_odds_events")]
     REDIS2[("Redis channel<br/>live_arbitrage_alerts<br/>(same Redis 7 instance)")]
-    PG[("PostgreSQL 15<br/>arb_events, team_aliases,<br/>scheduled_events")]
+    PG[("PostgreSQL 15<br/>arb_events, arb_snapshots,<br/>team_aliases, scheduled_events")]
 
     subgraph Delivery["API & Frontend"]
         API["scanner-api<br/>FastAPI: SSE, /api/events, /api/health/*"]
@@ -80,18 +80,18 @@ sequenceDiagram
         SC->>REDIS: SET heartbeat:bookmaker (TTL 135s)
     end
     REDIS->>ENG: OddsEvent
-    ENG->>ENG: Validate, resolve team names (EntityResolver), md5(home|away|start_utc)
+    ENG->>ENG: Validate, match fixture across bookmakers (EventMatcher), canonical event_id
     ENG->>PG: Upsert scheduled_events row (non-fatal)
-    ENG->>ENG: Drop prices older than 120s, best price per outcome, M = sum(1/d)
+    ENG->>ENG: Drop prices older than 120s, best price per outcome, M = sum(1/d), ROI > 10% held back as suspect
     alt M < 1, not previously active
         ENG->>REDIS: PUBLISH arb_new
-        ENG->>PG: Insert arb_events row
+        ENG->>PG: Insert arb_events row + arb_snapshots (new)
     else M < 1, already active
         ENG->>REDIS: PUBLISH arb_update
-        ENG->>PG: Update arb_events row
+        ENG->>PG: Update arb_events row + arb_snapshots (if margin/legs changed)
     else M >= 1, was active
         ENG->>REDIS: PUBLISH arb_expired (odds_moved)
-        ENG->>PG: Mark arb_events row expired
+        ENG->>PG: Mark arb_events row expired + arb_snapshots (expired)
     end
     REDIS->>API: live_arbitrage_alerts message (polled every ~1.1s per client)
     API->>UI: SSE event: arb_new / arb_update / arb_expired
@@ -148,21 +148,26 @@ flowchart TB
     USERBROWSER -->|SSE + REST| API
 ```
 
-## 4. Entity Resolution — Three-Tier Matching Pipeline
+## 4. Fixture Matching — Same Match Across Bookmakers
 
 ```mermaid
 flowchart TD
-    IN["Incoming scraped team name<br/>(league, name)"] --> T1{"Tier 1:<br/>In-memory exact match<br/>~1 us"}
-    T1 -->|hit| OUT["Canonical team name<br/>-> md5 event hash"]
-    T1 -->|miss| T2{"Tier 2:<br/>RapidFuzz token_sort_ratio<br/>same league only"}
-    T2 -->|score >= 88| CACHE["Write to in-memory cache"] --> OUT
-    T2 -->|score < 88| T3["Tier 3:<br/>Dead-letter queue (deduped)<br/>manual review"]
-    T3 --> RAW["Fallback: track under raw spelling<br/>(safe: missed arb, never a false one)"]
-    T3 -->|admin links team| LINK["entity_store.persist_manual_link<br/>-> Postgres team_aliases"] --> CACHE
-    STARTUP["Engine startup"] -->|load_aliases_into_resolver| CACHE
+    IN["OddsEvent from bookmaker B<br/>(sport, home, away, kickoff)"] --> AL["team_aliases override<br/>(optional, curated)"]
+    AL --> C{"Seen this exact fixture<br/>from B before?"}
+    C -->|yes, ~0.2 us| OUT["Canonical event_id<br/>(+ swap flag)"]
+    C -->|no| N["Normalise names<br/>accents, punctuation, FC/SC/and"]
+    N --> W["Candidates: same sport,<br/>kickoff within 15 min"]
+    W --> G{"Guards: marker tokens agree<br/>(W, U23, B, II...) and B has no<br/>other fixture in this event"}
+    G -->|fail| NEW
+    G -->|pass| S{"BOTH names fuzzy >= 88?<br/>token_sort (+ token_set for 2+ words),<br/>direct or swapped"}
+    S -->|yes| JOIN["Join existing event<br/>(swap odds if listed reversed)"] --> OUT
+    S -->|no| NEW["New canonical event<br/>md5(sport:home|away|kickoff)"] --> OUT
+    OUT --> ARB["Best price per outcome -> M = sum 1/d"]
+    ARB -->|ROI > 10%| SUS["suspect snapshot<br/>(recorded, not published)"]
+    ARB -->|0 < ROI <= 10%| PUB["arb_new / arb_update + arb_snapshots row"]
 ```
 
-**Status:** wired into OddsAggregator.ingest() for both team names (closed 2026-09-28). team_aliases is only populated via manual links today -- there is no admin UI for the dead-letter queue yet, so unresolved names are tracked under their raw spelling until someone links them.
+**Status:** rebuilt 2026-10-05 (engine/matching.py). Exact-name + exact-kickoff identity had split 489 real matches apart and production streamed zero arbs; on a live cycle the matcher joins ~380 fixtures across 2-6 bookmakers. Every fuzzy merge on 1,392 live fixtures was audited by hand.
 
 ## 5. Health Monitoring — Heartbeats
 

@@ -56,14 +56,14 @@ flowchart LR
     end
 
     subgraph Engine["scanner-engine (1 replica)"]
-        ER["EntityResolver&lt;br/&gt;exact -&gt; fuzzy -&gt; dead-letter"]
+        ER["EventMatcher&lt;br/&gt;sport + kickoff +-15 min + both names fuzzy"]
         AGG["OddsAggregator&lt;br/&gt;md5 event hash, 120s freshness gate,&lt;br/&gt;best price per outcome, &gt;= 2 bookmakers&lt;br/&gt;arb_new / arb_update / arb_expired"]
         MATH["Arbitrage Math&lt;br/&gt;M = sum(1/d) &lt; 1, S = B*IP/M"]
     end
 
     REDIS[("Redis channel&lt;br/&gt;raw_odds_events")]
     REDIS2[("Redis channel&lt;br/&gt;live_arbitrage_alerts&lt;br/&gt;(same Redis 7 instance)")]
-    PG[("PostgreSQL 15&lt;br/&gt;arb_events, team_aliases,&lt;br/&gt;scheduled_events")]
+    PG[("PostgreSQL 15&lt;br/&gt;arb_events, arb_snapshots,&lt;br/&gt;team_aliases, scheduled_events")]
 
     subgraph Delivery["API &amp; Frontend"]
         API["scanner-api&lt;br/&gt;FastAPI: SSE, /api/events, /api/health/*"]
@@ -112,18 +112,18 @@ sequenceDiagram
         SC-&gt;&gt;REDIS: SET heartbeat:bookmaker (TTL 135s)
     end
     REDIS-&gt;&gt;ENG: OddsEvent
-    ENG-&gt;&gt;ENG: Validate, resolve team names (EntityResolver), md5(home|away|start_utc)
+    ENG-&gt;&gt;ENG: Validate, match fixture across bookmakers (EventMatcher), canonical event_id
     ENG-&gt;&gt;PG: Upsert scheduled_events row (non-fatal)
-    ENG-&gt;&gt;ENG: Drop prices older than 120s, best price per outcome, M = sum(1/d)
+    ENG-&gt;&gt;ENG: Drop prices older than 120s, best price per outcome, M = sum(1/d), ROI &gt; 10% held back as suspect
     alt M &lt; 1, not previously active
         ENG-&gt;&gt;REDIS: PUBLISH arb_new
-        ENG-&gt;&gt;PG: Insert arb_events row
+        ENG-&gt;&gt;PG: Insert arb_events row + arb_snapshots (new)
     else M &lt; 1, already active
         ENG-&gt;&gt;REDIS: PUBLISH arb_update
-        ENG-&gt;&gt;PG: Update arb_events row
+        ENG-&gt;&gt;PG: Update arb_events row + arb_snapshots (if margin/legs changed)
     else M &gt;= 1, was active
         ENG-&gt;&gt;REDIS: PUBLISH arb_expired (odds_moved)
-        ENG-&gt;&gt;PG: Mark arb_events row expired
+        ENG-&gt;&gt;PG: Mark arb_events row expired + arb_snapshots (expired)
     end
     REDIS-&gt;&gt;API: live_arbitrage_alerts message (polled every ~1.1s per client)
     API-&gt;&gt;UI: SSE event: arb_new / arb_update / arb_expired
@@ -182,21 +182,26 @@ flowchart TB
 </pre>
 </div>
 
-<h2>4. Entity Resolution — Three-Tier Matching Pipeline</h2>
+<h2>4. Fixture Matching — Same Match Across Bookmakers</h2>
 <div class="diagram">
 <pre class="mermaid">
 flowchart TD
-    IN["Incoming scraped team name&lt;br/&gt;(league, name)"] --&gt; T1{"Tier 1:&lt;br/&gt;In-memory exact match&lt;br/&gt;~1 us"}
-    T1 --&gt;|hit| OUT["Canonical team name&lt;br/&gt;-&gt; md5 event hash"]
-    T1 --&gt;|miss| T2{"Tier 2:&lt;br/&gt;RapidFuzz token_sort_ratio&lt;br/&gt;same league only"}
-    T2 --&gt;|score &gt;= 88| CACHE["Write to in-memory cache"] --&gt; OUT
-    T2 --&gt;|score &lt; 88| T3["Tier 3:&lt;br/&gt;Dead-letter queue (deduped)&lt;br/&gt;manual review"]
-    T3 --&gt; RAW["Fallback: track under raw spelling&lt;br/&gt;(safe: missed arb, never a false one)"]
-    T3 --&gt;|admin links team| LINK["entity_store.persist_manual_link&lt;br/&gt;-&gt; Postgres team_aliases"] --&gt; CACHE
-    STARTUP["Engine startup"] --&gt;|load_aliases_into_resolver| CACHE
+    IN["OddsEvent from bookmaker B&lt;br/&gt;(sport, home, away, kickoff)"] --&gt; AL["team_aliases override&lt;br/&gt;(optional, curated)"]
+    AL --&gt; C{"Seen this exact fixture&lt;br/&gt;from B before?"}
+    C --&gt;|yes, ~0.2 us| OUT["Canonical event_id&lt;br/&gt;(+ swap flag)"]
+    C --&gt;|no| N["Normalise names&lt;br/&gt;accents, punctuation, FC/SC/and"]
+    N --&gt; W["Candidates: same sport,&lt;br/&gt;kickoff within 15 min"]
+    W --&gt; G{"Guards: marker tokens agree&lt;br/&gt;(W, U23, B, II...) and B has no&lt;br/&gt;other fixture in this event"}
+    G --&gt;|fail| NEW
+    G --&gt;|pass| S{"BOTH names fuzzy &gt;= 88?&lt;br/&gt;token_sort (+ token_set for 2+ words),&lt;br/&gt;direct or swapped"}
+    S --&gt;|yes| JOIN["Join existing event&lt;br/&gt;(swap odds if listed reversed)"] --&gt; OUT
+    S --&gt;|no| NEW["New canonical event&lt;br/&gt;md5(sport:home|away|kickoff)"] --&gt; OUT
+    OUT --&gt; ARB["Best price per outcome -&gt; M = sum 1/d"]
+    ARB --&gt;|ROI &gt; 10%| SUS["suspect snapshot&lt;br/&gt;(recorded, not published)"]
+    ARB --&gt;|0 &lt; ROI &lt;= 10%| PUB["arb_new / arb_update + arb_snapshots row"]
 </pre>
 </div>
-<p class="status">Status: wired into OddsAggregator.ingest() for both team names (closed 2026-09-28). team_aliases is only populated via manual links today -- there is no admin UI for the dead-letter queue yet, so unresolved names are tracked under their raw spelling until someone links them.</p>
+<p class="status">Status: rebuilt 2026-10-05 (engine/matching.py). Exact-name + exact-kickoff identity had split 489 real matches apart and production streamed zero arbs; on a live cycle the matcher joins ~380 fixtures across 2-6 bookmakers. Every fuzzy merge on 1,392 live fixtures was audited by hand.</p>
 
 <h2>5. Health Monitoring — Heartbeats</h2>
 <div class="diagram">

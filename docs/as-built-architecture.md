@@ -56,16 +56,19 @@ Each needed anti-bot evasion or a session/token mechanism, which is out of scope
 6 × scanner-ingestion-<bookmaker> ──PUBLISH──→ Redis: raw_odds_events ──→ scanner-engine
    (each also SETs heartbeat:<bookmaker>, TTL 135 s)                            │
                                                                                ├─ validate (Pydantic)
-                                                                               ├─ EntityResolver: exact → fuzzy → dead-letter
-                                                                               ├─ md5(home|away|start_utc) → event_id
+                                                                               ├─ team_aliases (curated overrides, optional)
+                                                                               ├─ EventMatcher: same sport, kickoff ±15 min,
+                                                                               │   both names fuzzy ≥ 88 → canonical event_id
                                                                                ├─ latest price per (event, market, bookmaker)
                                                                                ├─ drop prices > 120 s old
                                                                                ├─ best price per outcome, ≥ 2 distinct bookmakers
                                                                                ├─ arbitrage math (M = Σ 1/d < 1)
+                                                                               ├─ ROI > 10% → "suspect" (recorded, not published)
                                                                                ├─ arb_new / arb_update / arb_expired lifecycle
                                                                                │
                                                                                ├─→ Postgres: scheduled_events (every fixture),
-                                                                               │             arb_events (every arb change)
+                                                                               │             arb_events (latest state per arb),
+                                                                               │             arb_snapshots (every change)
                                                                                │
                                                                                └─PUBLISH─→ Redis: live_arbitrage_alerts
                                                                                               │
@@ -89,15 +92,25 @@ Scrapers, the engine and Redis are each pinned to exactly 1 replica — a second
 | 1.0 s + 0.1 s | SSE loop per client | `get_message(timeout=1.0)` + `sleep(0.1)`: ≤ ~1.1 s delivery delay; sends a keep-alive comment when idle. |
 | 300 s / 4 h | Engine prune interval / retention past kick-off | Bounds memory on a long-running process. |
 
-## Entity resolution
+## Fixture matching (which prices belong to the same match)
 
-`scanner-engine/normalization.py`'s `EntityResolver` (three tiers: exact alias cache → RapidFuzz `token_sort_ratio` ≥ 88, same league only → dead-letter queue) is called from `OddsAggregator.ingest()` for both `home_team` and `away_team` before events are hashed. At startup `__main__.py` loads the `team_aliases` table into the resolver (`entity_store.load_aliases_into_resolver`), so previously resolved aliases apply immediately.
+`scanner-engine/src/engine/matching.py`'s `EventMatcher` decides when two bookmakers' fixtures are the same real match. The rule is: same sport, kickoffs within **±15 minutes**, and **both** team names fuzzy-matching at ≥ 88. Names are first normalised: accents folded, punctuation and club noise words (FC, SC, "and") dropped. Scoring uses RapidFuzz `token_sort_ratio`, so "Monteiro, Thiago" = "Thiago Monteiro". For names of 2+ words it also uses `token_set_ratio`, so "CA Platense" = "Platense". A bookmaker listing the teams the other way round is detected, and its home/away odds are swapped. League is deliberately ignored, because every bookmaker names competitions differently.
 
-A name resolved via Tier 1 or 2 groups under its canonical name, so "Man Utd" and "Manchester United" at two bookmakers are the same event. An unresolved name is queued once (deduped by league + case-insensitive name) to `dead_letter_queue` and tracked under its own raw spelling in the meantime. The failure mode is always safe: a missed arbitrage, never a false one.
+The first bookmaker to report a match defines its canonical names, kickoff and `event_id` (MD5 of sport, normalised names and kickoff). Later matches reuse it. Each (bookmaker, fixture) is matched once and then cached: about 0.2 ms for a first sighting, 0.2 µs per repeat.
 
-Known limitations:
-- `team_aliases` is only populated via the manual-link path (`entity_store.persist_manual_link`). There is **no admin UI for the dead-letter queue yet**, so in practice most names currently resolve via their own raw spelling, and cross-bookmaker matching only works where spellings already agree exactly or fuzzy-match an existing alias.
-- Tier 2 is O(cache size) per unresolved lookup (≈ 2.5 ms against 500 aliases, measured locally) and runs on every poll cycle for a name that stays unresolved. The engine also logs a warning per unresolved name per cycle. Neither is a correctness problem; both shrink as the alias backlog is cleared.
+A wrong merge would fabricate an arb out of two unrelated matches, so the guards are conservative:
+- both names must match, never just one;
+- "marker" tokens (W/women, U19–U23, B, II, reserves, youth…) must agree exactly, so "Zimbabwe (W)" never merges with "Zimbabwe";
+- one bookmaker can never have two of its own fixtures merged into one event;
+- any arb above **10% ROI** is recorded as `suspect` and not published, since it's almost always a mismatch or a palpable pricing error.
+
+Why it was rebuilt (2026-10-05): the previous identity was MD5 over exact names plus an exact-to-the-second kickoff. On live data it split 489 pairs of real matches apart, and production streamed zero arbs. Validation of the new matcher:
+- **On 1,392 live fixtures:** 197 merges, and every one of the 45 that needed fuzzy, subset or swap matching was audited by hand and correct.
+- **On a full live scrape cycle:** 381 matches across 2–6 bookmakers, 5 arbs at 0.3–2.8% ROI, 0 suspect. Production began streaming arbs immediately after deploy.
+
+`team_aliases` (loaded into `EntityResolver` at startup) still works as an optional curated override, applied before matching. The aggregator no longer dead-letters unaliased names: a fixture only one bookmaker lists is normal, not an error.
+
+Known limits: a match whose two listings disagree on kickoff by more than 15 minutes, or whose names differ beyond the threshold (e.g. "Aviron Bayonne" vs "Aviron Bayonnais", 86.7), is still tracked separately. That's a missed arb, never a false one.
 
 ## Health monitoring
 
@@ -116,8 +129,9 @@ Known limitations:
 
 ## Database
 
-Real schema (`scanner-engine/src/engine/models_db.py`), migrated via Alembic:
-- `arb_events` — every detected arbitrage opportunity: margin, ROI, stakes (JSON), status (`active`/`expired`), expiry reason, first-detected / last-updated / expired timestamps.
+Real schema (`scanner-engine/src/engine/models_db.py`), migrated via Alembic. The engine runs `alembic upgrade head` itself at startup (`engine/migrations.py`), so schema changes ship with the image. Production's original tables were created by `create_all`, so on first boot the unversioned schema is stamped at `1a4a61ad1456` before upgrading.
+- `arb_events` — latest state of every detected arbitrage: margin, ROI, stakes (JSON), status (`active`/`expired`), expiry reason, first-detected / last-updated / expired timestamps. Arbs still `active` when the engine restarts are closed at startup with reason `engine_restart` at their `last_updated_at`. Treat those lifetimes as censored (a lower bound).
+- `arb_snapshots` — the time series behind lifetime and peak analysis: one row whenever an arb's margin or legs change, plus `new`, `expired` and `suspect` events. Each row records every leg's bookmaker, odds and scrape time, seconds to kickoff (negative means in-play), and the fixture-matching confidence. Unchanged re-confirmations aren't written; `arb_events.last_updated_at` carries the last time an arb was seen alive. Lifetimes are only as precise as the 45 s poll interval.
 - `team_aliases` — the entity-resolution dictionary (league, scraped name → universal name).
 - `scheduled_events` — every fixture any scraper has reported (arb or not), upserted by canonical `event_id`, for the Calendar page.
 
@@ -161,18 +175,17 @@ Deployment lessons (don't reintroduce):
 
 Measured on the first deployment (Azure Cost Management, 1–3 Oct 2026): **$18.70/day, about $560/month**. Of that, **86% was Log Analytics ingestion** (~5 GB/day at $3.29/GB). The engine was logging a warning for every unresolved team name, twice per event, on every 45 s cycle, and `team_aliases` is empty, so that was every event. All 10 Container Apps together were about $2.40/day, Postgres was free under the Students offer, and the registry was $0.17/day.
 
-Fixed on 2026-10-05: the engine logs each unresolved name once (when it's first dead-lettered), `arb_update` logs at DEBUG, and Log Analytics ingestion is capped at 0.5 GB/day, so a future log flood costs at most ~$1.70/day.
+Fixed on 2026-10-05: the per-name warning was first cut to once per name, then removed entirely when fixture matching was rebuilt the same day (an unaliased name is normal, not an error). `arb_update` logs at DEBUG, and Log Analytics ingestion is capped at 0.5 GB/day, so a future log flood costs at most ~$1.70/day.
 
 Expected now, at South Africa North retail prices: Container Apps ≈ $72, Postgres B1ms + 32 GB ≈ $19, registry ≈ $5, logs ≈ $0–5 (first 5 GB/month free), other ≈ $1, for a total of **≈ $95–100/month**. A `scanner-monthly` budget of $100 emails at 80%. A nightly off-window (scrapers and engine scaled to zero overnight via a cron scale rule) would save only ~$12/month, so it hasn't been built.
 
 ## Known gaps / possible next steps
 
-- **Dead-letter review UI** for entity resolution (the biggest lever for cross-bookmaker matching).
-- **Alembic isn't in the engine image** — its Dockerfile doesn't copy `alembic/` or `alembic.ini`, so migrations can't run in production. The current schema was bootstrapped by temporarily setting `AUTO_CREATE_TABLES=true`.
+- **Arb analysis** (once ~2 weeks of `arb_snapshots` exist): survival curves for time-to-place, peak timing, pre-match vs in-play, and the causing bookmaker, all per sport.
+- **Bankroll tooling:** per-bookmaker standby funds sized from history, a linear program to choose among simultaneous arbs given each book's balance, and a portfolio page tracking placed arbs and per-book balances before and after payout. The API has no authentication yet, so that must come first.
 - **SSE idle behaviour** through Container Apps' Envoy ingress hasn't been explicitly verified for long quiet periods (the ~1.1 s keep-alive should cover it).
 - **Hardening:** managed identity + AcrPull instead of ACR admin credentials; secrets (Postgres password) in Key Vault instead of tfvars.
 - More markets (totals, handicaps); N-way outrights would need a schema change.
-- Backtesting / analytics over the `arb_events` history.
 
 ## Legal / compliance status
 
