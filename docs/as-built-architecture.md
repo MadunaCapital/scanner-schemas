@@ -1,6 +1,6 @@
 # As-Built Architecture
 
-This is the current, real state of the project — as opposed to `arbitrage-scanner-plan.md`, which is the original brainstorming transcript (kept as a historical record; several of its specifics, like which bookmakers use what tech, turned out different once actually built) and its hardening addendum. Where the two disagree, this document is correct. Last updated 2026-09-29.
+This is the current, real state of the project — as opposed to `arbitrage-scanner-plan.md`, which is the original brainstorming transcript (kept as a historical record; several of its specifics, like which bookmakers use what tech, turned out different once actually built) and its hardening addendum. Where the two disagree, this document is correct. Last updated 2026-10-05.
 
 A long-form, illustrated version of this document (animated diagrams, the arbitrage math derived step by step, latency breakdown, Azure topology) lives in the dashboard itself: `scanner-frontend/src/components/docs/` ("Docs" in the side nav). Keep the two in sync.
 
@@ -129,26 +129,41 @@ All DB writes from the engine are best-effort: a Postgres failure is logged and 
 
 Not accounted for: execution risk between alert and placement, poll lag (a compared price can be up to ~45 s old), real bet limits, rounding to each book's minimum stake increments, and settlement-rule differences between books.
 
-## Infrastructure: Azure (UAE North)
+## Infrastructure: Azure (South Africa North)
 
-**Live and confirmed working end to end since 2026-09-28**: all 6 scrapers publishing real odds, engine writing to Postgres, API streaming, frontend deployed. `terraform apply` is clean.
+**Live and verified end to end since 2026-10-05** in subscription `maduna-scanner` (Aruna AI tenant, pay-as-you-go Azure Plan): all 6 scrapers publishing real odds, engine writing to Postgres, API streaming, frontend deployed.
+
+- Dashboard: https://arbitrage-scanner-frontend.happybeach-b55a0f45.southafricanorth.azurecontainerapps.io
+- API: https://arbitrage-scanner-api.happybeach-b55a0f45.southafricanorth.azurecontainerapps.io
+
+History: the first deployment (2026-09-28) ran in **UAE North** under an Azure for Students subscription, whose policy blocked South Africa North and ACR Tasks. Its credit ran out and it was disabled on 2026-10-03. It was rebuilt fresh in the new subscription on 2026-10-05, with no data carried over. The old subscription's data is purged on 2027-01-01, and nothing in it needs keeping.
 
 | Concern | Azure resource |
 |---|---|
 | Compute (10 apps) | Container Apps Environment in a delegated subnet (10.0.0.0/23) of VNet 10.0.0.0/16. 6 scrapers (0.25 vCPU / 0.5 GiB, 1 replica each), engine (0.5 vCPU / 1 GiB, 1 replica), Redis, API (external ingress :8000, 1–5 replicas, scales at 200 concurrent requests), frontend (nginx, external ingress :80, 1–3 replicas). |
-| Redis | **Self-hosted `redis:7-alpine` Container App**, internal-only TCP ingress on 6379, no persistence. `azurerm_redis_cache` is retired on this subscription. Must be addressed by the app's **short name** (`redis://arbitrage-scanner-redis:6379`) — the FQDN resolves but TCP connections time out. |
+| Redis | **Self-hosted `redis:7-alpine` Container App**, internal-only TCP ingress on 6379, no persistence. `azurerm_redis_cache` is retired. Must be addressed by the app's **short name** (`redis://arbitrage-scanner-redis:6379`) — the FQDN resolves but TCP connections time out. |
 | Database | PostgreSQL 15 Flexible Server (B_Standard_B1ms, 32 GB, 7-day backups), VNet-integrated in its own delegated subnet (10.0.3.0/24) with a private DNS zone, public access disabled. |
-| Container images | Azure Container Registry (Basic, admin credentials stored as Container App secrets). |
-| Logs | Log Analytics workspace, 30-day retention. |
-| Terraform state | Remote backend: storage account `arbscannertfstate` in its own resource group (`arbitrage-scanner-tfstate-rg`), so it survives deleting `arbitrage-scanner-rg`. |
-| Region | **UAE North** — South Africa North would be latency-optimal but is blocked by the subscription's regional policy. |
+| Container images | Azure Container Registry `arbitragescannerregistryza` (Basic, admin credentials stored as Container App secrets). |
+| Logs | Log Analytics workspace, 30-day retention, ingestion capped at 0.5 GB/day (`log_analytics_daily_quota_gb`). |
+| Terraform state | Remote backend: storage account `arbscannertfstateza` in its own resource group (`arbitrage-scanner-tfstate-rg`), so it survives deleting `arbitrage-scanner-rg`. |
+| Region | **South Africa North** (Johannesburg), the closest region to the bookmakers. |
+| Global names | Registry, Postgres server (`arbitrage-scanner-postgres-za`) and state storage carry the Terraform `name_suffix` (`za`), because the disabled first subscription still holds the unsuffixed names until it's purged. |
 
-**CI/CD:** every service repo has `.github/workflows/deploy.yml`: on push to `main` → `azure/login` (service principal in `AZURE_CREDENTIALS`) → `docker build` tagged with the commit SHA and `latest` → `az acr login` + `docker push` → `az containerapp update --image <sha>`. Builds run on the GitHub runner because ACR Tasks is blocked by subscription policy. The frontend's API URL is baked in at build time via the `VITE_API_URL` build arg.
+**CI/CD:** every service repo has `.github/workflows/deploy.yml`: on push to `main` → `azure/login` (service principal in `AZURE_CREDENTIALS`) → `docker build` tagged with the commit SHA and `latest` → `az acr login` + `docker push` → `az containerapp update --image <sha>`. Builds run on the GitHub runner rather than with ACR Tasks: the first subscription blocked Tasks, and runner builds work on any subscription. CI authenticates as the `scanner-deploy-za` service principal (Contributor on `arbitrage-scanner-rg`). The frontend's API URL is baked in at build time from the `VITE_API_URL` Actions variable on `scanner-frontend`. The full deploy order for a fresh subscription is in `scanner-infra/README.md`.
 
 Deployment lessons (don't reintroduce):
 - `infrastructure_resource_group_name` (Container Apps Environment) and `zone` (Postgres) are Azure-assigned and ForceNew/immutable — both are in `lifecycle.ignore_changes`.
 - Changing only a Container App secret does not roll a new revision; an explicit `az containerapp revision restart` is needed for the running container to see the new value.
 - Postgres VNet integration needs `public_network_access_enabled = false` set explicitly.
+- In a fresh subscription, the registry has to exist and hold images before Terraform can create the Container Apps: `terraform apply -target=azurerm_container_registry.main` first, push images via CI, then the full apply.
+
+## Cost
+
+Measured on the first deployment (Azure Cost Management, 1–3 Oct 2026): **$18.70/day, about $560/month**. Of that, **86% was Log Analytics ingestion** (~5 GB/day at $3.29/GB). The engine was logging a warning for every unresolved team name, twice per event, on every 45 s cycle, and `team_aliases` is empty, so that was every event. All 10 Container Apps together were about $2.40/day, Postgres was free under the Students offer, and the registry was $0.17/day.
+
+Fixed on 2026-10-05: the engine logs each unresolved name once (when it's first dead-lettered), `arb_update` logs at DEBUG, and Log Analytics ingestion is capped at 0.5 GB/day, so a future log flood costs at most ~$1.70/day.
+
+Expected now, at South Africa North retail prices: Container Apps ≈ $72, Postgres B1ms + 32 GB ≈ $19, registry ≈ $5, logs ≈ $0–5 (first 5 GB/month free), other ≈ $1, for a total of **≈ $95–100/month**. A `scanner-monthly` budget of $100 emails at 80%. A nightly off-window (scrapers and engine scaled to zero overnight via a cron scale rule) would save only ~$12/month, so it hasn't been built.
 
 ## Known gaps / possible next steps
 
@@ -156,7 +171,6 @@ Deployment lessons (don't reintroduce):
 - **Alembic isn't in the engine image** — its Dockerfile doesn't copy `alembic/` or `alembic.ini`, so migrations can't run in production. The current schema was bootstrapped by temporarily setting `AUTO_CREATE_TABLES=true`.
 - **SSE idle behaviour** through Container Apps' Envoy ingress hasn't been explicitly verified for long quiet periods (the ~1.1 s keep-alive should cover it).
 - **Hardening:** managed identity + AcrPull instead of ACR admin credentials; secrets (Postgres password) in Key Vault instead of tfvars.
-- Move to South Africa North if the subscription ever allows it.
 - More markets (totals, handicaps); N-way outrights would need a schema change.
 - Backtesting / analytics over the `arb_events` history.
 

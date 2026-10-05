@@ -1,6 +1,6 @@
 # Architecture Diagrams — MadunaCapital Arbitrage Scanner
 
-Reflects the **as-built** system (see [as-built-architecture.md](as-built-architecture.md)) as of 2026-09-29 — not the original brainstorm in [arbitrage-scanner-plan.md](arbitrage-scanner-plan.md), which assumed anti-bot evasion and AWS; neither turned out to be what was actually needed or used. Renders natively on GitHub; for a standalone browser view see `architecture-diagrams.html` in this same folder. An animated, interactive version lives in the dashboard's Docs page (`scanner-frontend/src/components/docs/`).
+Reflects the **as-built** system (see [as-built-architecture.md](as-built-architecture.md)) as of 2026-10-05 — not the original brainstorm in [arbitrage-scanner-plan.md](arbitrage-scanner-plan.md), which assumed anti-bot evasion and AWS; neither turned out to be what was actually needed or used. Renders natively on GitHub; for a standalone browser view see `architecture-diagrams.html` in this same folder. An animated, interactive version lives in the dashboard's Docs page (`scanner-frontend/src/components/docs/`).
 
 ## 1. System Architecture (End-to-End Data Flow)
 
@@ -99,20 +99,20 @@ sequenceDiagram
     U->>BM: Manually place bets on each leg
 ```
 
-## 3. Azure Infrastructure (UAE North)
+## 3. Azure Infrastructure (South Africa North)
 
 ```mermaid
 flowchart TB
     subgraph GH["GitHub (MadunaCapital, 12 repos)"]
-        ACT["GitHub Actions deploy.yml, on push to main<br/>docker build :sha :latest -> push to ACR -><br/>az containerapp update"]
+        ACT["GitHub Actions deploy.yml (SP scanner-deploy-za), on push to main<br/>docker build :sha :latest -> push to ACR -><br/>az containerapp update"]
         TF["scanner-infra<br/>Terraform (azurerm)"]
     end
 
     subgraph StateRG["arbitrage-scanner-tfstate-rg"]
-        STATE[("Storage account arbscannertfstate<br/>remote Terraform state")]
+        STATE[("Storage account arbscannertfstateza<br/>remote Terraform state")]
     end
 
-    subgraph Azure["arbitrage-scanner-rg -- UAE North<br/>(South Africa North disallowed by subscription policy)"]
+    subgraph Azure["arbitrage-scanner-rg -- South Africa North<br/>(subscription maduna-scanner)"]
         subgraph VNet["VNet 10.0.0.0/16"]
             subgraph CAEnv["Container Apps Environment (subnet 10.0.0.0/23)"]
                 SCR["6 bookmaker scrapers<br/>0.25 vCPU / 0.5 GiB, 1 replica each"]
@@ -122,11 +122,11 @@ flowchart TB
                 FE["scanner-frontend<br/>nginx, external ingress :80<br/>1-3 replicas"]
             end
             subgraph PGNet["Delegated subnet 10.0.3.0/24"]
-                PG[("Postgres Flexible Server<br/>PG 15, B1ms, private DNS,<br/>public access off")]
+                PG[("Postgres Flexible Server -za<br/>PG 15, B1ms, private DNS,<br/>public access off")]
             end
         end
-        ACR["Azure Container Registry (Basic)"]
-        LOGS["Log Analytics (30-day retention)"]
+        ACR["Container Registry arbitragescannerregistryza (Basic)"]
+        LOGS["Log Analytics<br/>30-day retention, 0.5 GB/day cap"]
     end
 
     USERBROWSER["User Browser"]
